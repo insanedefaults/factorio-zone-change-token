@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         Factorio Zone Token
-// @version      0.7.1
+// @version      0.8.0
 // @description  Save, name, and switch tokens on factorio.zone
 // @author       Rubydesic
 // @match        https://factorio.zone/
 // @match        https://valheim.zone/
 // @match        https://satisfactory.zone/
 // @grant        none
-// @downloadURL  https://raw.githubusercontent.com/Rubydesic/factorio-zone-change-token/master/factoriozone-token.user.js
+// @downloadURL  https://raw.githubusercontent.com/insanedefaults/factorio-zone-change-token/master/factoriozone-token.user.js
+// @updateURL    https://raw.githubusercontent.com/insanedefaults/factorio-zone-change-token/master/factoriozone-token.user.js
 // ==/UserScript==
 
 ;(function () {
@@ -17,11 +18,20 @@
     const SAVED = '_rubydesicTokens'
     const HISTORY = '_rubydesicTokenHistory'
     const PENDING = '_rubydesicPendingTokenName'
+    // Legacy slot names: { slot: name }, shared by every token. Read only for migration.
     const SAVE_NAMES = '_rubydesicSaveNames'
+    // Slot names per token: { token: { slot: name } }. Each token has its own save slots.
+    const SAVE_NAMES_BY_TOKEN = '_rubydesicSaveNamesByToken'
 
     let select
     let status
     let reload
+    // Re-applies slot names once the save list exists; called again when this tab's token is known.
+    let updateSaveNames = () => {}
+
+    function logError(context, error) {
+        console.error('Factorio Zone Token: ' + context, error)
+    }
 
     // Shared storage may change before this page's session does. Track its loaded token separately.
     let active = ''
@@ -60,7 +70,8 @@
         result.addEventListener('click', async () => {
             try {
                 await action()
-            } catch {
+            } catch (error) {
+                logError('action failed', error)
                 fail('Could not save changes. Check browser storage and try again.')
             }
         })
@@ -274,6 +285,7 @@
         sessionStorage.removeItem(PENDING)
         active = token
         refresh()
+        updateSaveNames()
         return true
     }
 
@@ -344,7 +356,8 @@
         modal.form.addEventListener('submit', () => {
             try {
                 action()
-            } catch {
+            } catch (error) {
+                logError('dialog action failed', error)
                 modal.fail('Could not save changes. Check browser storage and try again.')
             }
         })
@@ -540,12 +553,34 @@
 
     async function initializeSaves() {
         const saves = await waitFor('#saves')
+        const isMap = (value) => value && typeof value === 'object' && !Array.isArray(value)
+        const allNames = () => {
+            const value = read(SAVE_NAMES_BY_TOKEN, null)
+            return isMap(value) ? value : null
+        }
+
+        // Older versions kept one set of slot names for every token. Give that set to the
+        // first token this version sees, so existing names stay where they were most likely made.
+        function migrate() {
+            if (!active || allNames()) {
+                return
+            }
+            const legacy = read(SAVE_NAMES, {})
+            write(SAVE_NAMES_BY_TOKEN, isMap(legacy) ? { [active]: legacy } : {})
+        }
+
+        // Slot names for this tab's token. Without a token yet, there are no names to show.
         const names = () => {
-            const value = read(SAVE_NAMES, {})
-            return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+            const value = active ? (allNames() || {})[active] : null
+            return isMap(value) ? value : {}
         }
 
         function update() {
+            try {
+                migrate()
+            } catch (error) {
+                logError('slot name migration failed', error)
+            }
             const saved = names()
             for (const option of saves.options) {
                 const name = saved[option.value]
@@ -561,6 +596,7 @@
         }
 
         update()
+        updateSaveNames = update
         new MutationObserver(update).observe(saves, {
             childList: true,
             subtree: true,
@@ -571,6 +607,10 @@
             () => {
                 const option = saves.options[saves.selectedIndex]
                 if (!option) {
+                    return
+                }
+                if (!active) {
+                    report('Wait for a token before naming slots.')
                     return
                 }
                 const saved = names()
@@ -588,7 +628,9 @@
                 } else {
                     saved[option.value] = name
                 }
-                write(SAVE_NAMES, saved)
+                const all = allNames() || {}
+                all[active] = saved
+                write(SAVE_NAMES_BY_TOKEN, all)
                 if (name.toLowerCase() === 'reset') {
                     location.reload()
                 } else {
@@ -739,7 +781,8 @@
         select.addEventListener('change', () => {
             try {
                 switchTo(select.value)
-            } catch {
+            } catch (error) {
+                logError('switch failed', error)
                 refresh()
                 report('Could not switch. Check browser storage and try again.')
             }
@@ -755,14 +798,16 @@
         refresh()
         try {
             write(SAVED, tokens())
-        } catch {
+        } catch (error) {
+            logError('saving the token list failed', error)
             report('Could not save the token list. Check browser storage.')
         }
         // The website can issue the first token after its controls have rendered.
         const capture = () => {
             try {
                 return captureToken()
-            } catch {
+            } catch (error) {
+                logError('capturing the token failed', error)
                 report('Could not save the token list. Check browser storage.')
                 return true
             }
